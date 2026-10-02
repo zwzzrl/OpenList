@@ -240,12 +240,13 @@ func UpdateStorage(ctx context.Context, storage model.Storage) error {
 	if oldStorage.MountPath != storage.MountPath {
 		// mount path renamed, need to drop the storage
 		storagesMap.Delete(oldStorage.MountPath)
-		Cache.DeleteDirectoryTree(storageDriver, "/")
-		Cache.InvalidateStorageDetails(storageDriver)
 	}
 	if err != nil {
 		return errors.WithMessage(err, "failed get storage driver")
 	}
+	// settings changed, drop cached listings and details of the old storage
+	Cache.DeleteDirectoryTree(storageDriver, "/")
+	Cache.InvalidateStorageDetails(storageDriver)
 	err = storageDriver.Drop(ctx)
 	if err != nil {
 		return errors.Wrapf(err, "failed drop storage")
