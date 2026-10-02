@@ -152,14 +152,19 @@ func (d *Wopan) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Wopan) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	_, err := d.client.Upload2C(d.getSpaceType(), wopan.Upload2CFile{
+	if err := validateWoPanFileSize(stream.GetName(), stream.GetSize()); err != nil {
+		return err
+	}
+	_, err := d.upload2C(d.getSpaceType(), wopan.Upload2CFile{
 		Name:        stream.GetName(),
 		Size:        stream.GetSize(),
 		Content:     driver.NewLimitedUploadStream(ctx, stream),
 		ContentType: stream.GetMimetype(),
 	}, dstDir.GetID(), d.FamilyID, wopan.Upload2COption{
 		OnProgress: func(current, total int64) {
-			up(100 * float64(current) / float64(total))
+			if total > 0 {
+				up(100 * float64(current) / float64(total))
+			}
 		},
 		Ctx: ctx,
 	})
