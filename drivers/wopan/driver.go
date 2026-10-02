@@ -69,6 +69,8 @@ func (d *Wopan) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([
 		}
 		pageNum++
 	}
+	orderBy, orderDirection := d.getSortOrder()
+	model.SortFiles(res, orderBy, orderDirection)
 	return res, nil
 }
 

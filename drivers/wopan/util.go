@@ -8,22 +8,23 @@ import (
 
 // do others that not defined in Driver interface
 
-func (d *Wopan) getSortRule() int {
+// getSortOrder maps the storage sort rule to the order fields used by
+// model.SortFiles, so the rule is applied locally to the whole listing while
+// the WoPan list API keeps its own default order.
+func (d *Wopan) getSortOrder() (string, string) {
 	switch d.SortRule {
-	case "name_asc":
-		return wopan.SortNameAsc
 	case "name_desc":
-		return wopan.SortNameDesc
+		return "name", "desc"
 	case "time_asc":
-		return wopan.SortTimeAsc
+		return "modified", "asc"
 	case "time_desc":
-		return wopan.SortTimeDesc
+		return "modified", "desc"
 	case "size_asc":
-		return wopan.SortSizeAsc
+		return "size", "asc"
 	case "size_desc":
-		return wopan.SortSizeDesc
+		return "size", "desc"
 	default:
-		return wopan.SortNameAsc
+		return "name", "asc"
 	}
 }
 
