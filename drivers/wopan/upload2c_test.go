@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/wopan-sdk-go"
+	"github.com/sirupsen/logrus"
 )
 
 const uploadOK = `{"code":"0000","data":{"fid":"FID"},"msg":"ok"}`
@@ -174,6 +176,34 @@ func uploadToFake(t *testing.T, d *Wopan, name string, payload []byte, ctx conte
 		Content:     bytes.NewReader(payload),
 		ContentType: "application/octet-stream",
 	}, "dir-id", "", wopan.Upload2COption{Ctx: ctx})
+}
+
+// captureLogs redirects the process logger into a buffer until the test ends.
+// Tests in this package run sequentially, so swapping the global logger cannot
+// race with another test.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	prevOut, prevLevel, prevFormatter := utils.Log.Out, utils.Log.Level, utils.Log.Formatter
+	var buf bytes.Buffer
+	utils.Log.SetOutput(&buf)
+	utils.Log.SetFormatter(&logrus.TextFormatter{DisableColors: true, DisableTimestamp: true})
+	utils.Log.SetLevel(logrus.DebugLevel)
+	t.Cleanup(func() {
+		utils.Log.SetOutput(prevOut)
+		utils.Log.SetLevel(prevLevel)
+		utils.Log.SetFormatter(prevFormatter)
+	})
+	return &buf
+}
+
+func logLinesWith(buf *bytes.Buffer, substr string) []string {
+	var out []string
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func TestUpload2CSendsEveryPart(t *testing.T) {
@@ -463,5 +493,180 @@ func TestUpload2CConcurrentUploadsDoNotMixParts(t *testing.T) {
 		if left != nil {
 			t.Fatalf("upload %d was not received intact", i)
 		}
+	}
+}
+
+// A retried part is only visible through the retry hook, and retry-go hands the
+// hook the last attempt too (the one that gives up instead of repeating), so the
+// hook has to filter: a log that does not would report retries that never
+// happened and make the retry counts operators read meaningless.
+func TestUpload2CLogsEveryRetryAndNothingElse(t *testing.T) {
+	shrinkParts(t, 1024)
+	logs := captureLogs(t)
+	srv := newFakeWoPan(t, func(attempt int, p receivedPart) (int, string) {
+		if p.partIndex == 1 && attempt <= 2 {
+			return http.StatusInternalServerError, `{"code":"9999","msg":"boom"}`
+		}
+		return http.StatusOK, uploadOK
+	})
+	d := newTestWopan(t, srv.URL)
+
+	if _, err := uploadToFake(t, d, "movie.mp4", testPayload(2*1024), nil); err != nil {
+		t.Fatalf("upload2C: %v", err)
+	}
+
+	retries := logLinesWith(logs, "retrying")
+	if len(retries) != 2 {
+		t.Fatalf("got %d retry log lines, want 2 (attempts 2 and 3 of part 1):\n%s",
+			len(retries), logs.String())
+	}
+	joined := strings.Join(retries, "\n")
+	for _, field := range []string{"part 1/2", "attempt 2/3", "attempt 3/3"} {
+		if !strings.Contains(joined, field) {
+			t.Errorf("retry logs do not mention %q:\n%s", field, joined)
+		}
+	}
+	if warnings := logLinesWith(logs, "level=warning"); len(warnings) != 0 {
+		t.Errorf("an upload that succeeded logged warnings:\n%s", strings.Join(warnings, "\n"))
+	}
+}
+
+// A part that used up its retries is a real upload failure and must be visible
+// at the default log level, with the number of attempts that were made.
+func TestUpload2CLogsGivingUpAfterRetries(t *testing.T) {
+	shrinkParts(t, 1024)
+	logs := captureLogs(t)
+	srv := newFakeWoPan(t, func(attempt int, p receivedPart) (int, string) {
+		return http.StatusInternalServerError, `{"code":"9999","msg":"down"}`
+	})
+	d := newTestWopan(t, srv.URL)
+
+	if _, err := uploadToFake(t, d, "movie.mp4", testPayload(2*1024), nil); err == nil {
+		t.Fatal("upload2C succeeded although every attempt failed")
+	}
+
+	if got := len(logLinesWith(logs, "retrying")); got != 2 {
+		t.Fatalf("got %d retry log lines, want 2 (the two retries that did happen):\n%s",
+			got, logs.String())
+	}
+	if strings.Contains(logs.String(), "attempt 4/3") {
+		t.Errorf("a retry was logged for an attempt that can never happen:\n%s", logs.String())
+	}
+	gaveUp := logLinesWith(logs, "giving up")
+	if len(gaveUp) != 1 {
+		t.Fatalf("got %d give-up log lines, want 1:\n%s", len(gaveUp), logs.String())
+	}
+	for _, field := range []string{"part 1/2", "after 3 attempts"} {
+		if !strings.Contains(gaveUp[0], field) {
+			t.Errorf("give-up log does not mention %q: %s", field, gaveUp[0])
+		}
+	}
+}
+
+// A part the server rejects outright never reaches the retry hook (retry-go
+// breaks out before calling it), so the warning emitted after retry.Do is the
+// only trace: it is what tells an operator whether a business code classified as
+// permanent is really permanent, so it has to carry the status and the code.
+func TestUpload2CLogsPermanentRejection(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   []string
+	}{
+		{
+			name:   "http status",
+			status: http.StatusBadRequest,
+			body:   `{"code":"9999","msg":"bad request"}`,
+			want:   []string{"rejected permanently", "http status 400"},
+		},
+		{
+			name:   "business code",
+			status: http.StatusOK,
+			body:   `{"code":"1001","msg":"quota exceeded"}`,
+			want:   []string{"rejected permanently", "business code 1001"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shrinkParts(t, 1024)
+			logs := captureLogs(t)
+			srv := newFakeWoPan(t, func(attempt int, p receivedPart) (int, string) {
+				return tt.status, tt.body
+			})
+			d := newTestWopan(t, srv.URL)
+
+			if _, err := uploadToFake(t, d, "movie.mp4", testPayload(1024), nil); err == nil {
+				t.Fatal("upload2C accepted a permanent failure")
+			}
+
+			if retries := logLinesWith(logs, "retrying"); len(retries) != 0 {
+				t.Errorf("a permanent failure logged retries:\n%s", strings.Join(retries, "\n"))
+			}
+			rejected := logLinesWith(logs, "rejected permanently")
+			if len(rejected) != 1 {
+				t.Fatalf("got %d permanent-rejection log lines, want 1:\n%s",
+					len(rejected), logs.String())
+			}
+			for _, field := range append([]string{"part 1/1"}, tt.want...) {
+				if !strings.Contains(rejected[0], field) {
+					t.Errorf("rejection log does not mention %q: %s", field, rejected[0])
+				}
+			}
+		})
+	}
+}
+
+// A cancellation is the caller's own decision, not an upload failure: neither a
+// retry nor a rejection may be logged for it.
+func TestUpload2CLogsNothingWhenCanceled(t *testing.T) {
+	shrinkParts(t, 1024)
+	woPanPartRetryDelay = 50 * time.Millisecond
+	logs := captureLogs(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	srv := newFakeWoPan(t, func(attempt int, p receivedPart) (int, string) {
+		once.Do(cancel)
+		return http.StatusInternalServerError, `{"code":"9999","msg":"down"}`
+	})
+	d := newTestWopan(t, srv.URL)
+
+	if _, err := uploadToFake(t, d, "movie.mp4", testPayload(2*1024), ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if out := logs.String(); strings.Contains(out, "retrying") || strings.Contains(out, "wopan: upload part") {
+		t.Errorf("a canceled upload logged a part failure:\n%s", out)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// The first test only covers a cancellation that reaches resty as a context
+// error, which the classifier never treats as retriable. A cancellation can also
+// coincide with a plain transport failure, which is retriable: the hook must not
+// announce a retry that the already-finished context rules out.
+func TestUpload2CLogsNoRetryWhenContextIsAlreadyDone(t *testing.T) {
+	shrinkParts(t, 1024)
+	woPanPartRetryDelay = 50 * time.Millisecond
+	logs := captureLogs(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := newTestWopan(t, "http://wopan.invalid")
+	d.client.SetHttpClient(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		cancel() // the caller stops while the part is in flight
+		return nil, errors.New("connection reset by peer")
+	})})
+
+	_, err := uploadToFake(t, d, "movie.mp4", testPayload(1024), ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if out := logs.String(); strings.Contains(out, "retrying") || strings.Contains(out, "wopan: upload part") {
+		t.Errorf("a canceled upload logged a part failure:\n%s", out)
 	}
 }

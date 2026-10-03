@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/wopan-sdk-go"
 	"github.com/avast/retry-go"
 )
@@ -106,6 +107,34 @@ func isRetryableWoPanPartError(err error) bool {
 	return true
 }
 
+// logWoPanPartFailure reports the final outcome of one part. retry-go calls
+// OnRetry only for an attempt it is about to repeat, so a part that is rejected
+// permanently (4xx or a business code) is never seen there: it is logged here,
+// with the status or the code needed to spot a temporary one we misjudged as
+// permanent. The attempt count separates a part that used up its retries (a real
+// upload failure) from one the server refused outright.
+func logWoPanPartFailure(name string, partIndex, totalPart int64, err error) {
+	var partErr *woPanPartError
+	if !errors.As(err, &partErr) {
+		utils.Log.Warnf("wopan: upload part %d/%d of %q failed: %v", partIndex, totalPart, name, err)
+		return
+	}
+	if partErr.retryable() {
+		utils.Log.Warnf("wopan: giving up on upload part %d/%d of %q after %d attempts: %v",
+			partIndex, totalPart, name, woPanPartTries, err)
+		return
+	}
+	// An HTTP rejection carries no business code and a business rejection leaves
+	// the status at 200, so exactly one of the two identifies the refusal.
+	if partErr.code != "" {
+		utils.Log.Warnf("wopan: upload part %d/%d of %q rejected permanently with business code %s: %v",
+			partIndex, totalPart, name, partErr.code, err)
+		return
+	}
+	utils.Log.Warnf("wopan: upload part %d/%d of %q rejected permanently with http status %d: %v",
+		partIndex, totalPart, name, partErr.status, err)
+}
+
 // upload2C is a local copy of wopan-sdk-go's Upload2C with two important
 // differences:
 //
@@ -168,6 +197,16 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 	// it. It is deliberately local to this call — a shared buffer would let
 	// concurrent uploads overwrite each other's part data and mix chunks of
 	// different files, the very failure mode uniqueId generation had to fix.
+	//
+	// Memory budget: one buffer per in-flight upload, partSize bytes (8 MiB for
+	// WoPan) and up to 2*woPanPartSize, roughly 16 MiB, for the last part. How
+	// many uploads run at once is not bounded here: tasks.upload.workers only
+	// throttles task-style uploads, and browser chunk uploads bypass it, so
+	// resident memory grows with the client's upload concurrency (roughly
+	// N × 8-16 MiB). That is fine for the expected concurrency; a hard guard
+	// would be a WoPan-wide upload semaphore rather than a temp-file fallback.
+	// Until then, watch the per-part WARN lines from logWoPanPartFailure and the
+	// process memory of a heavily concurrent browser upload.
 	var partBuf []byte
 	var fid string
 	var finishedSize int64
@@ -243,6 +282,17 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 			retry.Delay(woPanPartRetryDelay),
 			retry.LastErrorOnly(true),
 			retry.RetryIf(isRetryableWoPanPartError),
+			retry.OnRetry(func(n uint, err error) {
+				// retry-go hands every retriable failure to this hook, including
+				// the last attempt (where it gives up instead of repeating) and
+				// one whose following delay returns at once because the context
+				// is already done. Only announce the attempts that really happen.
+				if n+1 >= woPanPartTries || ctx.Err() != nil {
+					return
+				}
+				utils.Log.Debugf("wopan: upload part %d/%d of %q failed, retrying (attempt %d/%d): %v",
+					partIndex, totalPart, file.Name, n+2, woPanPartTries, err)
+			}),
 		)
 		// A canceled context is not a part failure: return it unwrapped so the
 		// upload pipelines keep seeing the cancellation they expect.
@@ -250,6 +300,7 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 			return "", ctxErr
 		}
 		if err != nil {
+			logWoPanPartFailure(file.Name, partIndex, totalPart, err)
 			return "", err
 		}
 
