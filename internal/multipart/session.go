@@ -437,6 +437,12 @@ func (s *Session) finishAttempt(win *Window, err error) {
 	}
 }
 
+// isPermanentPutError decides whether a failed pipeline attempt is final or
+// retriable by asking the client for the whole file again. Failures that no
+// retry can fix (the storage can never accept this file, or the destination is
+// not writable) are permanent: retrying them would only make the client
+// re-upload the entire file to fail the same way. Everything else, including a
+// canceled context, stays retriable.
 func isPermanentPutError(err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return false

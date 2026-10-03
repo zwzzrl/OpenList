@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -187,15 +188,21 @@ func TestSessionRetriableRefill(t *testing.T) {
 
 func TestSessionPermanentFailure(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
+		name    string
+		err     error
+		wantErr string
 	}{
-		{"permission denied", fmt.Errorf("denied: %w", errs.PermissionDenied)},
+		{
+			name:    "permission denied",
+			err:     fmt.Errorf("denied: %w", errs.PermissionDenied),
+			wantErr: "denied: permission denied",
+		},
 		{
 			name: "file above the storage size limit",
 			err: errs.NewErr(errs.UploadLimitExceeded,
 				"file %q size %d exceeds WoPan maximum file size of %d bytes (4 GiB)",
 				"test.bin", int64(5)<<30, int64(4)<<30-1),
+			wantErr: `upload limit exceeded; file "test.bin" size 5368709120 exceeds WoPan maximum file size of 4294967295 bytes (4 GiB)`,
 		},
 	}
 	for _, tt := range tests {
@@ -218,6 +225,11 @@ func TestSessionPermanentFailure(t *testing.T) {
 			failed := waitState(t, m, user, snap.ID, StateFailedPermanent)
 			if failed.Attempt != 0 {
 				t.Fatalf("attempt = %d, want 0: a permanent failure must not be retried", failed.Attempt)
+			}
+			// The client can only learn why the upload can never succeed from
+			// the snapshot: the state alone says "do not retry", not "why".
+			if !strings.Contains(failed.Error, tt.wantErr) {
+				t.Fatalf("snapshot error = %q, want it to contain %q", failed.Error, tt.wantErr)
 			}
 			if _, err := m.Chunk(user, snap.ID, 0, bytes.NewReader(data)); err == nil {
 				t.Fatal("chunk on failed_permanent session: expected error")
