@@ -18,6 +18,10 @@ type Wopan struct {
 	Addition
 	client          *wopan.WoClient
 	defaultFamilyID string
+	// uploads remembers the WoPan session of an interrupted upload per client
+	// upload session, so the next attempt of that session can send only the
+	// parts WoPan is missing. See upload2C and woPanUploadCache.
+	uploads woPanUploadCache
 }
 
 func (d *Wopan) Config() driver.Config {
@@ -157,7 +161,12 @@ func (d *Wopan) Put(ctx context.Context, dstDir model.Obj, stream model.FileStre
 	if err := validateWoPanFileSize(stream.GetName(), stream.GetSize()); err != nil {
 		return err
 	}
-	_, err := d.upload2C(d.getSpaceType(), wopan.Upload2CFile{
+	// Resume the WoPan session a previous attempt of this client upload left
+	// behind, if there is one: a multipart retry is fed the file from chunk 0
+	// again, and without this every part would be uploaded a second time.
+	sessionID := uploadSessionID(stream)
+	resume := d.uploads.begin(sessionID, stream.GetSize())
+	_, committed, err := d.upload2C(d.getSpaceType(), wopan.Upload2CFile{
 		Name:        stream.GetName(),
 		Size:        stream.GetSize(),
 		Content:     driver.NewLimitedUploadStream(ctx, stream),
@@ -169,7 +178,8 @@ func (d *Wopan) Put(ctx context.Context, dstDir model.Obj, stream model.FileStre
 			}
 		},
 		Ctx: ctx,
-	})
+	}, resume)
+	d.uploads.finish(sessionID, resume, committed, err)
 	return err
 }
 

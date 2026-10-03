@@ -390,6 +390,11 @@ func (m *Manager) startAttemptLocked(s *Session) error {
 		},
 		Reader:   win,
 		Mimetype: s.Mimetype,
+		// Every attempt of this session is fed from chunk 0, so a driver cannot
+		// tell a retry from a new upload by the stream alone. The session id lets
+		// one that can continue an interrupted server-side upload resume it
+		// instead of sending the already stored parts again.
+		UploadSessionID: s.ID,
 	}
 	fileStream.Add(win)
 

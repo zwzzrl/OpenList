@@ -170,12 +170,13 @@ func uploadToFake(t *testing.T, d *Wopan, name string, payload []byte, ctx conte
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return d.upload2C(wopan.SpaceTypePersonal, wopan.Upload2CFile{
+	fid, _, err := d.upload2C(wopan.SpaceTypePersonal, wopan.Upload2CFile{
 		Name:        name,
 		Size:        int64(len(payload)),
 		Content:     bytes.NewReader(payload),
 		ContentType: "application/octet-stream",
-	}, "dir-id", "", wopan.Upload2COption{Ctx: ctx})
+	}, "dir-id", "", wopan.Upload2COption{Ctx: ctx}, nil)
+	return fid, err
 }
 
 // captureLogs redirects the process logger into a buffer until the test ends.
@@ -464,12 +465,12 @@ func TestUpload2CRejectsTruncatedStream(t *testing.T) {
 	d := newTestWopan(t, srv.URL)
 
 	payload := testPayload(1500) // the stream claims 2500 bytes, i.e. two parts
-	_, err := d.upload2C(wopan.SpaceTypePersonal, wopan.Upload2CFile{
+	_, _, err := d.upload2C(wopan.SpaceTypePersonal, wopan.Upload2CFile{
 		Name:        "movie.mp4",
 		Size:        2500,
 		Content:     bytes.NewReader(payload),
 		ContentType: "application/octet-stream",
-	}, "dir-id", "", wopan.Upload2COption{Ctx: context.Background()})
+	}, "dir-id", "", wopan.Upload2COption{Ctx: context.Background()}, nil)
 	if err == nil {
 		t.Fatal("upload2C accepted a truncated stream")
 	}

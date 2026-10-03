@@ -186,6 +186,66 @@ func TestSessionRetriableRefill(t *testing.T) {
 	}
 }
 
+// The driver can only continue an interrupted upload if it can tell an attempt
+// of the same client upload from a new one: every attempt is fed from chunk 0,
+// so the stream has to carry the session id.
+func TestAttemptStreamCarriesTheUploadSessionID(t *testing.T) {
+	m := setupSessionTest(t)
+	const chunkSize = 1024
+	totalSize := int64(2 * chunkSize)
+	data := genData(totalSize)
+	user := testUser()
+
+	var mu sync.Mutex
+	var seen []string
+	attempts := 0
+	stubPut(t, func(ctx context.Context, dst string, fs *stream.FileStream, up driver.UpdateProgress) error {
+		defer fs.Close()
+		mu.Lock()
+		seen = append(seen, fs.UploadSessionID)
+		attempts++
+		attempt := attempts
+		mu.Unlock()
+		if attempt == 1 {
+			// Fail after the first chunk so the session becomes retriable.
+			buf := make([]byte, chunkSize)
+			if _, err := io.ReadFull(fs, buf); err != nil {
+				return err
+			}
+			return errors.New("transient storage hiccup")
+		}
+		_, err := io.Copy(io.Discard, fs)
+		return err
+	})
+
+	snap, _, err := m.Init(initReq(user, totalSize, chunkSize))
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	sendChunk(t, m, user, snap.ID, data, 0, chunkSize)
+	waitState(t, m, user, snap.ID, StateFailedRetriable)
+	sendChunk(t, m, user, snap.ID, data, 0, chunkSize)
+	sendChunk(t, m, user, snap.ID, data, 1, chunkSize)
+	final, err := m.Complete(context.Background(), user, snap.ID)
+	if err != nil {
+		t.Fatalf("Complete after refill: %v", err)
+	}
+	if final.State != StateCompleted {
+		t.Fatalf("final state = %s, want completed", final.State)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 {
+		t.Fatalf("driver saw %d attempts, want 2", len(seen))
+	}
+	for i, id := range seen {
+		if id != snap.ID {
+			t.Fatalf("attempt %d stream carries upload session id %q, want %q", i+1, id, snap.ID)
+		}
+	}
+}
+
 func TestSessionPermanentFailure(t *testing.T) {
 	tests := []struct {
 		name    string

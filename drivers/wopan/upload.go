@@ -168,7 +168,13 @@ var errWoPanUploadNotCommitted = errors.New("wopan: the server accepted every pa
 // sends them unchanged. Only partIndex and partSize differ between parts, and a
 // retry repeats the failing part's values, so the retry writes the same bytes
 // under the same key as the attempt it repeats.
-func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID string, familyID string, opt wopan.Upload2COption) (string, error) {
+//
+// resume, when non-nil, continues the WoPan session it names instead of opening
+// a new one: the committed leading bytes are read off file.Content and dropped,
+// and sending starts at the part that follows them. The second result is the
+// number of leading bytes the server holds when the call returns; after a failed
+// call that is what a caller continuing the upload must pass back.
+func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID string, familyID string, opt wopan.Upload2COption, resume *woPanResume) (string, int64, error) {
 	client := d.client
 	zoneURL := wopan.DefaultZoneURL
 	if client.ZoneURL != "" {
@@ -195,7 +201,7 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 	}
 	fileInfoStr, err := client.EncryptParam(wopan.ChannelWoHome, fileInfo)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	uploadURL := zoneURL + "/openapi/client/" + wopan.KeyUpload2C
@@ -203,8 +209,19 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 	if totalPart == 0 {
 		totalPart = 1
 	}
+	uploadID := nextWoPanUploadID()
+	var committed int64
+	if resume != nil {
+		if resume.uniqueID != "" {
+			uploadID = resume.uniqueID
+		}
+		// Only whole parts can be skipped: WoPan stores bytes under a partIndex,
+		// so an offset inside a part belongs to a part that has to be re-sent.
+		committed = min(resume.committed, file.Size)
+		committed -= committed % woPanPartSize
+	}
 	formData := map[string]string{
-		"uniqueId":    nextWoPanUploadID(),
+		"uniqueId":    uploadID,
 		"accessToken": accessToken,
 		"fileName":    file.Name,
 		"psToken":     "undefined",
@@ -213,6 +230,18 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 		"channel":     wopan.ChannelWoCloud,
 		"directoryId": targetDirID,
 		"fileInfo":    fileInfoStr,
+	}
+
+	if committed > 0 {
+		// Every attempt is fed the file from its beginning, so the bytes WoPan
+		// already holds are consumed and dropped here. file.Content is a one-way
+		// stream (the multipart window or a limited upload stream): skipping them
+		// in any other way is not possible, and the parts they belong to are not
+		// sent again.
+		if _, err := io.CopyN(io.Discard, file.Content, committed); err != nil {
+			return "", committed, errs.NewErr(errs.StreamIncomplete,
+				"failed to skip the %d bytes WoPan already holds: %v", committed, err)
+		}
 	}
 
 	// partBuf holds the part that is currently being sent, so that a retry can
@@ -233,15 +262,18 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 	// process memory of a heavily concurrent browser upload.
 	var partBuf []byte
 	var fid string
-	var finishedSize int64
-	for partIndex := int64(1); partIndex <= totalPart; partIndex++ {
+	finishedSize := committed
+	for partIndex := committed/woPanPartSize + 1; partIndex <= totalPart; partIndex++ {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", finishedSize, err
 		}
 
+		// partSize follows from the absolute part index rather than from how much
+		// of the stream this call has already sent: a resumed call starts in the
+		// middle of the file and must still send the last part in full.
 		partSize := woPanPartSize
 		if partIndex == totalPart {
-			partSize = file.Size - finishedSize
+			partSize = file.Size - (totalPart-1)*woPanPartSize
 		}
 
 		// Read the whole part before sending it. Besides making the attempt
@@ -252,7 +284,7 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 		}
 		part := partBuf[:partSize]
 		if _, err := io.ReadFull(file.Content, part); err != nil {
-			return "", errs.NewErr(errs.StreamIncomplete,
+			return "", finishedSize, errs.NewErr(errs.StreamIncomplete,
 				"partIndex: %d, failed to read %d bytes: %v", partIndex, partSize, err)
 		}
 
@@ -324,22 +356,16 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 		// A canceled context is not a part failure: return it unwrapped so the
 		// upload pipelines keep seeing the cancellation they expect.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
+			return "", finishedSize, ctxErr
 		}
 		if err != nil {
 			logWoPanPartFailure(file.Name, partIndex, totalPart, err)
-			return "", err
+			return "", finishedSize, err
 		}
 
-		// The last part is the one that commits the upload, and WoPan marks that
-		// by returning the file id with it. Every part can answer 0000 while the
-		// server stores nothing (for instance when it no longer has the session
-		// the earlier parts belonged to), so an empty id here must fail the
-		// upload: returning success would lose the file without a trace.
+		// WoPan answers every accepted part with 0000 and returns the file id only
+		// with the part that commits the upload, so only that part's id counts.
 		if partIndex == totalPart {
-			if partFid == "" {
-				return "", errWoPanUploadNotCommitted
-			}
 			fid = partFid
 		}
 
@@ -348,5 +374,12 @@ func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID 
 			opt.OnProgress(finishedSize, file.Size)
 		}
 	}
-	return fid, nil
+
+	// An upload no part committed stored nothing, whether the loop stopped early
+	// (every part was already there) or ended without the commit response. Both
+	// report a failure: claiming success would lose the file without a trace.
+	if fid == "" {
+		return "", finishedSize, errWoPanUploadNotCommitted
+	}
+	return fid, finishedSize, nil
 }

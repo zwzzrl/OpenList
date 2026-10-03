@@ -28,6 +28,11 @@ type FileStream struct {
 	WebPutAsTask      bool
 	ForceStreamUpload bool
 	Exist             model.Obj //the file existed in the destination, we can reuse some info since we wil overwrite it
+	// UploadSessionID identifies the client upload session a multipart upload
+	// belongs to. Every attempt of one session carries the same id, which lets a
+	// driver that can continue an interrupted server-side upload tell a retry of
+	// the same upload apart from a new one. It is empty on every other path.
+	UploadSessionID string
 	utils.Closers
 	size      int64
 	oriReader io.Reader // the original reader, used for caching
