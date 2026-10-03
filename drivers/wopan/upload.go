@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/wopan-sdk-go"
 )
 
@@ -35,9 +36,13 @@ func nextWoPanUploadID() string {
 	return strconv.FormatInt(id, 10)
 }
 
+// validateWoPanFileSize rejects files above the WoPan limit. The error wraps
+// errs.UploadLimitExceeded so upload pipelines can tell an unsupported file
+// size (permanent: retrying cannot succeed) apart from transient failures and
+// stop re-uploading the whole file.
 func validateWoPanFileSize(name string, size int64) error {
 	if size > maxWoPanFileSize {
-		return fmt.Errorf(
+		return errs.NewErr(errs.UploadLimitExceeded,
 			"file %q size %d exceeds WoPan maximum file size of %d bytes (4 GiB)",
 			name, size, maxWoPanFileSize,
 		)

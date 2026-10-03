@@ -3,11 +3,13 @@ package template
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 )
@@ -90,6 +92,9 @@ func TestValidateWoPanFileSize(t *testing.T) {
 			if !tt.wantErr && err != nil {
 				t.Fatalf("size %d was rejected: %v", tt.size, err)
 			}
+			if tt.wantErr && !errors.Is(err, errs.UploadLimitExceeded) {
+				t.Fatalf("size %d error %v does not wrap errs.UploadLimitExceeded", tt.size, err)
+			}
 		})
 	}
 }
@@ -120,5 +125,8 @@ func TestPutRejectsOversizedFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "movie.mkv") {
 		t.Fatalf("error %q does not mention the file name", err)
+	}
+	if !errors.Is(err, errs.UploadLimitExceeded) {
+		t.Fatalf("error %v does not wrap errs.UploadLimitExceeded", err)
 	}
 }

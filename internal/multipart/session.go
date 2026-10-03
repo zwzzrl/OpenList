@@ -443,6 +443,7 @@ func isPermanentPutError(err error) bool {
 	}
 	for _, target := range []error{
 		errs.UploadNotSupported,
+		errs.UploadLimitExceeded,
 		errs.PermissionDenied,
 		errs.StorageNotFound,
 		errs.ObjectAlreadyExists,

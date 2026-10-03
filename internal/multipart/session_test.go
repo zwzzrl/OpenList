@@ -186,26 +186,85 @@ func TestSessionRetriableRefill(t *testing.T) {
 }
 
 func TestSessionPermanentFailure(t *testing.T) {
-	m := setupSessionTest(t)
-	const chunkSize = 1024
-	data := genData(chunkSize)
-	user := testUser()
-
-	stubPut(t, func(ctx context.Context, dst string, fs *stream.FileStream, up driver.UpdateProgress) error {
-		defer fs.Close()
-		return fmt.Errorf("denied: %w", errs.PermissionDenied)
-	})
-
-	snap, _, err := m.Init(initReq(user, chunkSize, chunkSize))
-	if err != nil {
-		t.Fatalf("Init: %v", err)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{"permission denied", fmt.Errorf("denied: %w", errs.PermissionDenied)},
+		{
+			name: "file above the storage size limit",
+			err: errs.NewErr(errs.UploadLimitExceeded,
+				"file %q size %d exceeds WoPan maximum file size of %d bytes (4 GiB)",
+				"test.bin", int64(5)<<30, int64(4)<<30-1),
+		},
 	}
-	waitState(t, m, user, snap.ID, StateFailedPermanent)
-	if _, err := m.Chunk(user, snap.ID, 0, bytes.NewReader(data)); err == nil {
-		t.Fatal("chunk on failed_permanent session: expected error")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := setupSessionTest(t)
+			const chunkSize = 1024
+			data := genData(chunkSize)
+			user := testUser()
+
+			putErr := tt.err
+			stubPut(t, func(ctx context.Context, dst string, fs *stream.FileStream, up driver.UpdateProgress) error {
+				defer fs.Close()
+				return putErr
+			})
+
+			snap, _, err := m.Init(initReq(user, chunkSize, chunkSize))
+			if err != nil {
+				t.Fatalf("Init: %v", err)
+			}
+			failed := waitState(t, m, user, snap.ID, StateFailedPermanent)
+			if failed.Attempt != 0 {
+				t.Fatalf("attempt = %d, want 0: a permanent failure must not be retried", failed.Attempt)
+			}
+			if _, err := m.Chunk(user, snap.ID, 0, bytes.NewReader(data)); err == nil {
+				t.Fatal("chunk on failed_permanent session: expected error")
+			}
+			if _, err := m.Complete(context.Background(), user, snap.ID); err == nil {
+				t.Fatal("Complete on failed_permanent session: expected error")
+			}
+		})
 	}
-	if _, err := m.Complete(context.Background(), user, snap.ID); err == nil {
-		t.Fatal("Complete on failed_permanent session: expected error")
+}
+
+// isPermanentPutError decides whether a failed pipeline attempt is retried or
+// reported to the client as final. A storage that can never accept the file
+// (e.g. it is above the driver's size limit) must be permanent, otherwise the
+// client re-uploads the whole file on every retry.
+func TestIsPermanentPutError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"transient network error", errors.New("connection reset by peer"), false},
+		{"canceled", context.Canceled, false},
+		{"wrapped canceled", fmt.Errorf("aborted: %w", context.Canceled), false},
+		{"upload not supported", errs.UploadNotSupported, true},
+		{"upload limit exceeded", errs.UploadLimitExceeded, true},
+		{"wrapped upload limit exceeded", fmt.Errorf("Put: %w", errs.UploadLimitExceeded), true},
+		{
+			name: "wopan oversized file error",
+			err: errs.NewErr(errs.UploadLimitExceeded,
+				"file %q size %d exceeds WoPan maximum file size of %d bytes (4 GiB)",
+				"movie.mkv", int64(5)<<30, int64(4)<<30-1),
+			want: true,
+		},
+		{"permission denied", errs.PermissionDenied, true},
+		{"storage not found", errs.StorageNotFound, true},
+		{"object already exists", errs.ObjectAlreadyExists, true},
+		{"relative path", errs.RelativePath, true},
+		{"ignored system file", errs.IgnoredSystemFile, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPermanentPutError(tt.err); got != tt.want {
+				t.Fatalf("isPermanentPutError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 
