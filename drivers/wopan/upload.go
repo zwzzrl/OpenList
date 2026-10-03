@@ -30,6 +30,11 @@ var (
 	woPanPartSize = wopan.DefaultPartSize
 	// woPanPartTries bounds the attempts made for a single part, and
 	// woPanPartRetryDelay is the delay before the second attempt (doubled after).
+	// A part therefore blocks for at most woPanPartRetryDelay + 2*woPanPartRetryDelay
+	// = 3s. The driver drains no part of the multipart ring while it waits, so a
+	// concurrent chunk write may have to wait for a slot: 3s stays well inside
+	// multipart.WindowWaitTimeout (10s), so a part retry cannot by itself push a
+	// client chunk into ErrOutOfWindow.
 	woPanPartTries      uint = 3
 	woPanPartRetryDelay      = time.Second
 )
@@ -142,8 +147,15 @@ func logWoPanPartFailure(name string, partIndex, totalPart int64, err error) {
 //     time.Now().UnixMilli(). The latter collides for concurrent uploads and
 //     makes WoPan mix chunks from different files. The SDK does not expose a way
 //     to pass a caller-provided uniqueId.
-//  2. A failed part is retried within the same session (same uniqueId, same
-//     partIndex) instead of the whole file being re-sent from part 1.
+//  2. A failed part is retried within the same session instead of the whole file
+//     being re-sent from part 1.
+//
+// The session is fixed for the whole upload, not just for the retry: uniqueId,
+// batchNo, the encrypted fileInfo (which carries batchNo), fileName and fileSize
+// are all built once, before the part loop, and every attempt of every part
+// sends them unchanged. Only partIndex and partSize differ between parts, and a
+// retry repeats the failing part's values, so the retry writes the same bytes
+// under the same key as the attempt it repeats.
 func (d *Wopan) upload2C(spaceType string, file wopan.Upload2CFile, targetDirID string, familyID string, opt wopan.Upload2COption) (string, error) {
 	client := d.client
 	zoneURL := wopan.DefaultZoneURL
