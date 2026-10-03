@@ -130,3 +130,20 @@ func TestPutRejectsOversizedFile(t *testing.T) {
 		t.Fatalf("error %v does not wrap errs.UploadLimitExceeded", err)
 	}
 }
+
+// WoPan answers 0000 for every accepted part and returns the file id only with
+// the response that commits the upload. An upload that never commits has to fail
+// here: Put returning nil would report a successful upload that stored nothing.
+func TestPutFailsWhenWoPanNeverCommits(t *testing.T) {
+	shrinkParts(t, 1024)
+	d := newTestWopan(t, newNoFidWoPan(t).URL)
+	payload := testPayload(2 * 1024)
+	file := &stream.FileStream{
+		Obj:    &model.Object{Name: "movie.mp4", Size: int64(len(payload))},
+		Reader: bytes.NewReader(payload),
+	}
+	err := d.Put(context.Background(), &model.Object{ID: "dir-id", IsFolder: true}, file, func(float64) {})
+	if !errors.Is(err, errWoPanUploadNotCommitted) {
+		t.Fatalf("Put error = %v, want errWoPanUploadNotCommitted", err)
+	}
+}

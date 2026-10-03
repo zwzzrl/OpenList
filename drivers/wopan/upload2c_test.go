@@ -257,6 +257,56 @@ func TestUpload2CSendsEveryPart(t *testing.T) {
 	}
 }
 
+// newNoFidWoPan answers every part with 0000 and no file id, the way WoPan
+// answers when it accepts the bytes but never commits a file.
+func newNoFidWoPan(t *testing.T) *fakeWoPan {
+	t.Helper()
+	return newFakeWoPan(t, func(attempt int, p receivedPart) (int, string) {
+		return http.StatusOK, `{"code":"0000","data":{},"msg":"ok"}`
+	})
+}
+
+// WoPan attaches the file id to the response that commits the upload and leaves
+// it empty on every other part, so only the committing part's fid counts.
+func TestUpload2COnlyTheCommittingPartReportsTheFileID(t *testing.T) {
+	shrinkParts(t, 1024)
+	srv := newFakeWoPan(t, func(attempt int, p receivedPart) (int, string) {
+		if p.partIndex != p.totalPart {
+			return http.StatusOK, `{"code":"0000","data":{},"msg":"ok"}`
+		}
+		return http.StatusOK, `{"code":"0000","data":{"fid":"FID-LAST"},"msg":"ok"}`
+	})
+	d := newTestWopan(t, srv.URL)
+
+	fid, err := uploadToFake(t, d, "movie.mp4", testPayload(3*1024), nil)
+	if err != nil {
+		t.Fatalf("upload2C: %v", err)
+	}
+	if fid != "FID-LAST" {
+		t.Fatalf("fid = %q, want the fid reported by the committing part", fid)
+	}
+}
+
+// The server can accept every part without storing anything, for example when
+// it no longer has the session the earlier parts belonged to. That has to fail
+// the upload: a nil error would report success for a file that does not exist.
+func TestUpload2CFailsWhenNoPartReportsAFileID(t *testing.T) {
+	shrinkParts(t, 1024)
+	srv := newNoFidWoPan(t)
+	d := newTestWopan(t, srv.URL)
+
+	fid, err := uploadToFake(t, d, "movie.mp4", testPayload(2*1024), nil)
+	if !errors.Is(err, errWoPanUploadNotCommitted) {
+		t.Fatalf("upload2C error = %v, want errWoPanUploadNotCommitted", err)
+	}
+	if fid != "" {
+		t.Fatalf("fid = %q, want empty on a failed upload", fid)
+	}
+	if got := len(srv.parts()); got != 2 {
+		t.Fatalf("got %d requests, want 2: every part is sent before the result is judged", got)
+	}
+}
+
 // A retried part must resend exactly the same bytes: file.Content is a one-way
 // stream, so an implementation that re-reads it would upload the next part's
 // bytes under the failed index.
